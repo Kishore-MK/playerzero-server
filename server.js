@@ -47,7 +47,7 @@ function createInitialGameState() {
   return {
     currentRound: 1,
     maxRounds: 20,
-    timeRemaining: { hours: 0, minutes: 1, seconds: 0 },
+    timeRemaining: { hours: 0, minutes: 1,seconds:0},
     players: [],
     marketChanges: [
       { resource: 'gold', change: 0, percentage: '+0%' },
@@ -416,13 +416,13 @@ io.on('connection', (socket) => {
   });
 
   // NEW: Handle market price updates from host
-  socket.on('update-market-prices', (data) => {
+  socket.on('update-market-prices', async (data) => {
     try {
       const playerInfo = players.get(socket.id);
       if (!playerInfo) return;
       
       const game = activeGameStates.get(playerInfo.gameId);
-      if (!game || game.status !== 'playing') return;
+      if (!game || (game.status !== 'playing' && game.status !== 'waiting-for-final-prices')) return;
       
       // Verify that the player is the host
       const isHost = (
@@ -449,7 +449,13 @@ io.on('connection', (socket) => {
         
         console.log(`Host ${playerInfo.playerName} updated market prices for game ${playerInfo.gameId}:`, game.marketPrices);
         
-         
+        // Check if this is the final market price update (game waiting for final prices)
+        if (game.status === 'waiting-for-final-prices' && game.waitingForFinalPrices) {
+          console.log(`📊 Final market prices received for game ${playerInfo.gameId}, finishing game...`);
+          // Finish the game with final market prices
+          await finishGame(playerInfo.gameId);
+          return;
+        }
         
         activeGameStates.set(playerInfo.gameId, game);
         
@@ -553,6 +559,28 @@ io.on('connection', (socket) => {
     io.to(playerInfo.gameId).emit('game-state', game);
   });
 
+  // Optional: Add a specific endpoint to get game results
+  socket.on('get-game-results', (data) => {
+    const { gameId } = data;
+    const game = activeGameStates.get(gameId);
+    
+    if (!game || game.status !== 'finished') {
+      socket.emit('error', { message: 'Game not finished or not found' });
+      return;
+    }
+    
+    socket.emit('game-results', {
+      winner: game.winner,
+      finalScores: game.finalScores,
+      marketPrices: game.marketPrices,
+      gameStats: {
+        totalRounds: game.maxRounds,
+        totalPlayers: game.players.length,
+        totalActions: Object.values(game.actionHistory || {}).flat().length || 0
+      }
+    });
+  });
+
   // Handle disconnect
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
@@ -585,48 +613,98 @@ io.on('connection', (socket) => {
   });
 });
 
-// Helper function to finish game
+// Helper function to check if game has ended
+function checkGameEnd(gameState) {
+  return gameState.currentRound > gameState.maxRounds;
+}
+
+// Helper function to calculate final scores
+function calculateFinalScores(players, marketPrices) {
+  return players.map(player => {
+    const assetValue = 
+      (player.assets.gold * marketPrices.gold) +
+      (player.assets.water * marketPrices.water) +
+      (player.assets.oil * marketPrices.oil);
+    
+    const finalScore = player.tokens + assetValue;
+    
+    return {
+      ...player,
+      assetValue,
+      finalScore
+    };
+  }).sort((a, b) => b.finalScore - a.finalScore);
+}
+
+// Helper function to determine winner
+function determineWinner(players, marketPrices) {
+  const scoredPlayers = calculateFinalScores(players, marketPrices);
+  return scoredPlayers[0]; // Player with highest score
+}
+
+// Helper function to prepare game for ending (sets waiting-for-final-prices status)
+async function prepareGameEnd(gameId) {
+  try {
+    const game = activeGameStates.get(gameId);
+    if (!game) return;
+    
+    console.log(`⏳ Preparing game ${gameId} for final calculation`);
+    
+    // Set status to indicate waiting for final market prices
+    game.status = 'waiting-for-final-prices';
+    game.timerActive = false;
+    game.waitingForFinalPrices = true;
+    
+    activeGameStates.set(gameId, game);
+    
+    // Notify that we're waiting for final market prices
+    io.to(gameId).emit('game-ending', {
+      message: 'Game ended, calculating final scores...'
+    });
+    
+    console.log(`⏳ Game ${gameId} prepared for ending, waiting for final market prices`);
+    
+  } catch (error) {
+    console.error('Error preparing game end:', error);
+  }
+}
+
+// Helper function to finish game (called after final market prices are updated)
 async function finishGame(gameId) {
   try {
     const game = activeGameStates.get(gameId);
     if (!game) return;
     
-    // Calculate final scores using current market prices
+    console.log(`🏆 Finishing game ${gameId} with final market prices`);
+    
+    // Calculate final scores using final updated market prices
     const marketPrices = game.marketPrices || { gold: 100, water: 50, oil: 150 };
     
-    const finalPlayers = game.players.map(player => {
-      const goldValue = player.assets.gold * marketPrices.gold;
-      const waterValue = player.assets.water * marketPrices.water;
-      const oilValue = player.assets.oil * marketPrices.oil;
-      const finalScore = player.tokens + goldValue + waterValue + oilValue;
-      
-      return {
-        ...player,
-        finalScore
-      };
-    });
-    
-    // Sort by final score to determine winner
-    finalPlayers.sort((a, b) => b.finalScore - a.finalScore);
+    const finalPlayers = calculateFinalScores(game.players, marketPrices);
+    const winner = finalPlayers[0];
     
     game.status = 'finished';
     game.timerActive = false;
-    game.winner = finalPlayers[0];
+    game.winner = winner;
     game.finalScores = finalPlayers;
+    game.waitingForFinalPrices = false;
     
     activeGameStates.set(gameId, game);
     
     // Update database
     await GameDatabase.updateGameStatus(gameId, 'finished');
     
+    console.log(`🏆 Game ${gameId} finished. Winner: ${winner.name} with score ${winner.finalScore}`);
+    console.log(`🏆 Final market prices: Gold: ${marketPrices.gold}, Water: ${marketPrices.water}, Oil: ${marketPrices.oil}`);
+    
     // Notify all players
     io.to(gameId).emit('game-finished', {
-      winner: game.winner,
-      finalScores: finalPlayers
+      winner: winner,
+      finalScores: finalPlayers,
+      marketPrices: marketPrices
     });
     
     io.to(gameId).emit('game-state', game);
-    
     
   } catch (error) {
     console.error('Error finishing game:', error);
@@ -740,8 +818,8 @@ function startGameTimer(gameId) {
         game.recentActions = [];
         
         if (game.currentRound > game.maxRounds) {
-          // Game finished
-          await finishGame(gameId);
+          // Game ended - prepare for final calculation
+          await prepareGameEnd(gameId);
           clearInterval(timer);
           gameTimers.delete(gameId);
           return;
@@ -790,6 +868,8 @@ function startGameTimer(gameId) {
         active: true,
         timeRemaining: 10
       };
+      
+      // Note: Game end check will happen after the 10-second delay when currentRound increments
       
       // Emit round ended event with delay time
       io.to(gameId).emit('round-ended', {
