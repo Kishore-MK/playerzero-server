@@ -482,8 +482,8 @@ io.on('connection', (socket) => {
     // Reset inactivity timer since there's activity
     resetInactivityTimer(playerInfo.gameId);
     
-    const { action, resource, amount, targetPlayer } = data;
-    console.log("Player action data:", action, resource.toLowerCase(), amount, targetPlayer);
+    const { action, resource, amount, targetPlayer, transactionHash } = data;
+    console.log("Player action data:", action, resource.toLowerCase(), amount, targetPlayer, transactionHash);
     
     const player = game.players.find(p => p.id === playerInfo.playerId);
     
@@ -550,7 +550,12 @@ io.on('connection', (socket) => {
     
     // Add action to recent actions
     if (actionText) {
-      game.recentActions.unshift(actionText);
+      // Include transaction hash if available
+      const actionWithTx = transactionHash && transactionHash !== 'pending' 
+        ? `${actionText} (TX: ${transactionHash})`
+        : actionText;
+      
+      game.recentActions.unshift(actionWithTx);
       game.recentActions = game.recentActions.slice(0, 10); // Keep only last 10 actions
     }
     
@@ -947,7 +952,7 @@ setInterval(async () => {
   }
 }, 60 * 60 * 1000); // Every hour
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, '0.0.0.0', async () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Access from other devices: http://YOUR_IP_ADDRESS:${PORT}`);
